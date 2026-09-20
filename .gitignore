@@ -73,3 +73,12 @@ yarn-error.log
 !.yarn/releases
 !.yarn/sdks
 !.yarn/versions
+
+# Local files and secrets
+crash.txt
+*.log
+.env
+.env.*
+!.env.example
+
+src/config/env.ts
