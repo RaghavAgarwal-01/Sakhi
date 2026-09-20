@@ -1,0 +1,39 @@
+{
+  "Version": "2019-10-30",
+  "StartAction": "a1a1a1a1-0000-4000-8000-000000000001",
+  "Metadata": {
+    "entryPointPosition": { "x": 40, "y": 40 },
+    "ActionMetadata": {
+      "a1a1a1a1-0000-4000-8000-000000000001": { "position": { "x": 220, "y": 40 } },
+      "a1a1a1a1-0000-4000-8000-000000000002": { "position": { "x": 480, "y": 40 } }
+    },
+    "Annotations": [],
+    "name": "Sakhi Severe Voice Alert",
+    "description": "Speaks the severe SOS message with dynamic victim name, then disconnects. Attributes VictimName and MapsUrl are passed in by Sakhi_TriggerVoiceCall's start_outbound_voice_contact call.",
+    "type": "contactFlow",
+    "status": "SAVED",
+    "hash": {}
+  },
+  "Actions": [
+    {
+      "Identifier": "a1a1a1a1-0000-4000-8000-000000000001",
+      "Type": "MessageParticipant",
+      "Parameters": {
+        "Text": "Urgent Sakhi S O S. $.Attributes.VictimName did not respond to the safety timer. This is an active emergency. A live tracking link has already been sent by text message. Please check on them immediately.",
+        "TextToSpeechVoice": "Joanna"
+      },
+      "Transitions": {
+        "NextAction": "a1a1a1a1-0000-4000-8000-000000000002",
+        "Errors": [
+          { "NextAction": "a1a1a1a1-0000-4000-8000-000000000002", "ErrorType": "NoMatchingError" }
+        ]
+      }
+    },
+    {
+      "Identifier": "a1a1a1a1-0000-4000-8000-000000000002",
+      "Type": "DisconnectParticipant",
+      "Parameters": {},
+      "Transitions": {}
+    }
+  ]
+}

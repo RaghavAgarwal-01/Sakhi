@@ -1,0 +1,13 @@
+# AWS/SAM generated files
+.aws-sam/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Secrets / credentials
+*.csv
+.env
+.env.*
+*.pem
+*.key

@@ -1,0 +1,155 @@
+{
+  "Comment": "Sakhi 2-stage escalation for SCREAM_DETECTED / CODEWORD incidents only. Manual triggers never enter this machine.",
+  "StartAt": "SendMildAlert",
+  "States": {
+    "SendMildAlert": {
+      "Type": "Task",
+      "Comment": "T=0: mild warning SMS to family only. No police/helpline involvement at this stage.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${SendNotificationFunctionArn}",
+        "Payload": {
+          "action": "MILD",
+          "incidentId.$": "$.incidentId"
+        }
+      },
+      "ResultPath": null,
+      "Next": "WaitForCancellationWindow"
+    },
+
+    "WaitForCancellationWindow": {
+      "Type": "Wait",
+      "Comment": "T=0 to T=60: window in which the mobile app can call POST /incidents/:id/cancel after biometric auth.",
+      "Seconds": 60,
+      "Next": "CheckCancellationStatus"
+    },
+
+    "CheckCancellationStatus": {
+      "Type": "Task",
+      "Comment": "Direct DynamoDB read (no Lambda needed) — relies on the /cancel handler having set status=CANCELLED.",
+      "Resource": "arn:aws:states:::dynamodb:getItem",
+      "Parameters": {
+        "TableName": "${TableName}",
+        "Key": {
+          "PK": {
+            "S.$": "States.Format('INCIDENT#{}', $.incidentId)"
+          },
+          "SK": {
+            "S": "METADATA"
+          }
+        }
+      },
+      "ResultPath": "$.incidentRecord",
+      "Next": "WasCancelled"
+    },
+
+    "WasCancelled": {
+      "Type": "Choice",
+      "Comment": "Missing Item or missing status both fall through to Default — a vanished record fails safe toward escalation, not toward silent cancellation.",
+      "Choices": [
+        {
+          "Variable": "$.incidentRecord.Item.status.S",
+          "StringEquals": "CANCELLED",
+          "Next": "SendAllClear"
+        }
+      ],
+      "Default": "EscalateToSevere"
+    },
+
+    "SendAllClear": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${SendNotificationFunctionArn}",
+        "Payload": {
+          "action": "ALL_CLEAR",
+          "incidentId.$": "$.incidentId"
+        }
+      },
+      "ResultPath": null,
+      "Next": "CancelledSafely"
+    },
+
+    "CancelledSafely": {
+      "Type": "Succeed"
+    },
+
+    "EscalateToSevere": {
+      "Type": "Parallel",
+      "Comment": "T=60, not cancelled: three independent branches fire together. This is the ONLY point where police/helpline are contacted.",
+      "Branches": [
+        {
+          "StartAt": "SendSevereAlert",
+          "States": {
+            "SendSevereAlert": {
+              "Type": "Task",
+              "Comment": "(a) severe SMS to family via SNS.",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${SendNotificationFunctionArn}",
+                "Payload": {
+                  "action": "SEVERE",
+                  "incidentId.$": "$.incidentId"
+                }
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "TriggerFamilyVoiceCall",
+          "States": {
+            "TriggerFamilyVoiceCall": {
+              "Type": "Task",
+              "Comment": "(b) automated outbound voice call to family. Lambda is a mocked stub until Amazon Connect/Pinpoint is wired up.",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${TriggerVoiceCallFunctionArn}",
+                "Payload": {
+                  "incidentId.$": "$.incidentId"
+                }
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "DispatchToPoliceHelpline",
+          "States": {
+            "DispatchToPoliceHelpline": {
+              "Type": "Task",
+              "Comment": "(c) mark the incident SEVERE_ACTIVE via direct DynamoDB update. A DynamoDB Stream + WebSocket push Lambda (Day 2) reacts to this change to fan the full victim dossier out to connected police/helpline dashboard clients — this branch does not push over the socket itself.",
+              "Resource": "arn:aws:states:::dynamodb:updateItem",
+              "Parameters": {
+                "TableName": "${TableName}",
+                "Key": {
+                  "PK": {
+                    "S.$": "States.Format('INCIDENT#{}', $.incidentId)"
+                  },
+                  "SK": {
+                    "S": "METADATA"
+                  }
+                },
+                "UpdateExpression": "SET #status = :status",
+                "ExpressionAttributeNames": {
+                  "#status": "status"
+                },
+                "ExpressionAttributeValues": {
+                  ":status": {
+                    "S": "SEVERE_ACTIVE"
+                  }
+                }
+              },
+              "End": true
+            }
+          }
+        }
+      ],
+      "Next": "EscalationComplete"
+    },
+
+    "EscalationComplete": {
+      "Type": "Succeed"
+    }
+  }
+}

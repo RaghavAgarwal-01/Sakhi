@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Virtual environment
+venv/
+.venv/
+
+# AWS SAM
+.aws-sam/
+samconfig.toml
+packaged.yaml
+*.zip
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+env.json
+local-env.json
+
+# Dashboard (Vite / Node)
+node_modules/
+dashboard/dist/
+
+# Logs
+*.log
+
+# OS / editor
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,544 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Sakhi backend. DynamoDB table + Streams, core Lambdas, the escalation
+  state machine, the full REST API, a WebSocket API pushing
+  ACTIVE_EMERGENCY_DISPATCH to the dashboard, and real Amazon Connect
+  outbound voice calling (mocked until an instance/flow/number are
+  supplied via the Parameters below). The dashboard UI itself is still
+  to come.
+
+Parameters:
+  TableName:
+    Type: String
+    Default: Sakhi_Records
+  ConnectionsTableName:
+    Type: String
+    Default: Sakhi_Connections
+  LocalDynamoDbEndpoint:
+    Type: String
+    Default: ""
+    Description: >
+      Only for local testing via `sam local start-api --parameter-overrides`.
+      Set to http://dynamodb-local:8000 to point at DynamoDB Local. Leave
+      blank for real deployments — an empty string becomes None in the
+      Lambda code, so boto3 falls back to real AWS as normal.
+  ConnectInstanceId:
+    Type: String
+    Default: ""
+    Description: >
+      Amazon Connect instance ID (from an instance created out-of-band
+      in the Connect console). Leave blank to keep Sakhi_TriggerVoiceCall
+      mocked.
+  ConnectContactFlowId:
+    Type: String
+    Default: ""
+    Description: >
+      Contact flow ID after importing connect/sakhi_voice_alert_flow.json
+      into the instance above and publishing it.
+  ConnectSourcePhoneNumber:
+    Type: String
+    Default: ""
+    Description: Claimed Amazon Connect phone number to call FROM, in E.164 format.
+  MockSns:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Set true only for local/demo dry runs. Real family SMS requires false.
+  MockVoiceCall:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Set true only for dry runs. Real family calls require false and Amazon Connect configuration.
+  SmsSenderId:
+    Type: String
+    Default: ""
+    Description: Optional registered Sender ID. Leave blank for the fastest India sandbox test using the default international route.
+  SmsEntityId:
+    Type: String
+    Default: ""
+    Description: TRAI/DLT Entity ID for India transactional SMS.
+  SmsMildTemplateId:
+    Type: String
+    Default: ""
+    Description: TRAI/DLT Template ID matching the exact MILD SMS copy.
+  SmsSevereTemplateId:
+    Type: String
+    Default: ""
+    Description: TRAI/DLT Template ID matching the exact SEVERE SMS copy.
+  SmsAllClearTemplateId:
+    Type: String
+    Default: ""
+    Description: TRAI/DLT Template ID matching the exact ALL_CLEAR SMS copy.
+  SmsManualTemplateId:
+    Type: String
+    Default: ""
+    Description: TRAI/DLT Template ID matching the exact MANUAL SMS copy.
+
+Resources:
+  SakhiApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: Sakhi_Api
+      StageName: dev
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"   # tighten to the deployed dashboard origin before Day 3
+      # All six REST endpoints from the API contract are wired below.
+
+  SakhiRecordsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Sakhi_Records
+      BillingMode: PAY_PER_REQUEST   # no capacity planning needed for a 3-day hackathon
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES   # feeds Sakhi_DispatchOnSevereIncident
+      # Single-table design:
+      #   USER#<userId>     / PROFILE  -> name, age, phoneNumber, address,
+      #                                    photoUrl, customCodeword,
+      #                                    inferencePreference, emergencyContacts[]
+      #   INCIDENT#<id>     / METADATA -> userId, status, triggerType,
+      #                                    timestamp, currentLocation,
+      #                                    audioSnippetUrl, cancellationTime
+
+  SakhiConnectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Sakhi_Connections
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: connectionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: connectionId
+          KeyType: HASH
+      # One row per open dashboard WebSocket connection. No auth/roles
+      # yet — every connected client gets every severe-stage dispatch.
+
+  SakhiCheckIncidentStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: Sakhi_CheckIncidentStatus
+      Handler: sakhi_check_incident_status.handler
+      Runtime: python3.11
+      CodeUri: src/
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          DYNAMODB_ENDPOINT_URL: !Ref LocalDynamoDbEndpoint
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref SakhiRecordsTable
+      Events:
+        GetIncidentStatus:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SakhiApi
+            Path: /incidents/{id}/status
+            Method: GET
+
+  SakhiSendNotificationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: Sakhi_SendNotification
+      Handler: sakhi_send_notification.handler
+      Runtime: python3.11
+      CodeUri: src/
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          MOCK_SNS: !Ref MockSns
+          SMS_SENDER_ID: !Ref SmsSenderId
+          SMS_ENTITY_ID: !Ref SmsEntityId
+          SMS_MILD_TEMPLATE_ID: !Ref SmsMildTemplateId
+          SMS_SEVERE_TEMPLATE_ID: !Ref SmsSevereTemplateId
+          SMS_ALL_CLEAR_TEMPLATE_ID: !Ref SmsAllClearTemplateId
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref SakhiRecordsTable
+        - SNSPublishMessagePolicy:
+            TopicName: "*"   # tighten to real topic ARNs once they exist
+
+  SakhiTriggerVoiceCallFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: Sakhi_TriggerVoiceCall
+      Handler: sakhi_trigger_voice_call.handler
+      Runtime: python3.11
+      CodeUri: src/
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          MOCK_VOICE_CALL: !Ref MockVoiceCall
+          CONNECT_INSTANCE_ID: !Ref ConnectInstanceId
+          CONNECT_CONTACT_FLOW_ID: !Ref ConnectContactFlowId
+          CONNECT_SOURCE_PHONE_NUMBER: !Ref ConnectSourcePhoneNumber
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref SakhiRecordsTable
+        - Statement:
+            - Effect: Allow
+              Action: connect:StartOutboundVoiceContact
+              Resource: !Sub "arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}/*"
+
+  SakhiManualIncidentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: Sakhi_ManualIncident
+      Handler: sakhi_manual_incident.handler
+      Runtime: python3.11
+      CodeUri: src/
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          DYNAMODB_ENDPOINT_URL: !Ref LocalDynamoDbEndpoint
+          MOCK_SNS: !Ref MockSns
+          SMS_SENDER_ID: !Ref SmsSenderId
+          SMS_ENTITY_ID: !Ref SmsEntityId
+          SMS_MANUAL_TEMPLATE_ID: !Ref SmsManualTemplateId
+          SMS_MILD_TEMPLATE_ID: !Ref SmsMildTemplateId
+          SMS_SEVERE_TEMPLATE_ID: !Ref SmsSevereTemplateId
+          SMS_ALL_CLEAR_TEMPLATE_ID: !Ref SmsAllClearTemplateId
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SakhiRecordsTable
+        - SNSPublishMessagePolicy:
+            TopicName: "*"
+      Events:
+        PostManualIncident:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SakhiApi
+            Path: /incidents/manual
+            Method: POST
+  
+  SakhiClassifyAudioFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: Sakhi_ClassifyAudio
+      Handler: sakhi_classify_audio.handler
+      Runtime: python3.11
+      CodeUri: src/
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          MOCK_CLASSIFIER: "true"
+      Events:
+        PostClassify:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SakhiApi
+            Path: /classify
+            Method: POST
+
+  SakhiCreateUserFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: Sakhi_CreateUser
+      Handler: sakhi_create_user.handler
+      Runtime: python3.11
+      CodeUri: src/
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          DYNAMODB_ENDPOINT_URL: !Ref LocalDynamoDbEndpoint
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SakhiRecordsTable
+      Events:
+        PostUser:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SakhiApi
+            Path: /users
+            Method: POST
+
+  SakhiCreateIncidentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: Sakhi_CreateIncident
+      Handler: sakhi_create_incident.handler
+      Runtime: python3.11
+      CodeUri: src/
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          STATE_MACHINE_ARN: !Ref SakhiEscalationStateMachine
+          DYNAMODB_ENDPOINT_URL: !Ref LocalDynamoDbEndpoint
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SakhiRecordsTable
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !GetAtt SakhiEscalationStateMachine.Name
+      Events:
+        PostIncident:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SakhiApi
+            Path: /incidents
+            Method: POST
+
+  SakhiCancelIncidentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: Sakhi_CancelIncident
+      Handler: sakhi_cancel_incident.handler
+      Runtime: python3.11
+      CodeUri: src/
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          DYNAMODB_ENDPOINT_URL: !Ref LocalDynamoDbEndpoint
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SakhiRecordsTable
+      Events:
+        PostCancelIncident:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SakhiApi
+            Path: /incidents/{id}/cancel
+            Method: POST
+
+  SakhiUpdateLocationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: Sakhi_UpdateLocation
+      Handler: sakhi_update_location.handler
+      Runtime: python3.11
+      CodeUri: src/
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          DYNAMODB_ENDPOINT_URL: !Ref LocalDynamoDbEndpoint
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SakhiRecordsTable
+      Events:
+        PostIncidentLocation:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SakhiApi
+            Path: /incidents/{id}/location
+            Method: POST
+
+  SakhiWebSocketConnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: Sakhi_WebSocketConnect
+      Handler: sakhi_ws_connect.handler
+      Runtime: python3.11
+      CodeUri: src/
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTableName
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SakhiConnectionsTable
+
+  SakhiWebSocketDisconnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: Sakhi_WebSocketDisconnect
+      Handler: sakhi_ws_disconnect.handler
+      Runtime: python3.11
+      CodeUri: src/
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTableName
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SakhiConnectionsTable
+
+  SakhiDispatchOnSevereIncidentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: Sakhi_DispatchOnSevereIncident
+      Handler: sakhi_dispatch_on_severe.handler
+      Runtime: python3.11
+      CodeUri: src/
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          CONNECTIONS_TABLE: !Ref ConnectionsTableName
+          WEBSOCKET_ENDPOINT: !Sub "https://${SakhiWebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/dev"
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref SakhiRecordsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SakhiConnectionsTable
+        - Statement:
+            - Effect: Allow
+              Action: execute-api:ManageConnections
+              Resource: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SakhiWebSocketApi}/*"
+      Events:
+        SevereStatusStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt SakhiRecordsTable.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 5
+            # Cuts most table writes out before they even invoke this
+            # function — only rows whose NEW image flips to SEVERE_ACTIVE
+            # get through.
+            FilterCriteria:
+              Filters:
+                - Pattern: '{"dynamodb": {"NewImage": {"status": {"S": ["SEVERE_ACTIVE"]}}}}'
+
+  # --- Raw WebSocket API (SAM has no native WebSocket resource type) ---
+
+  SakhiWebSocketApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: Sakhi_WebSocketApi
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: "$request.body.action"
+
+  SakhiConnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref SakhiWebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SakhiWebSocketConnectFunction.Arn}/invocations"
+
+  SakhiConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref SakhiWebSocketApi
+      RouteKey: "$connect"
+      Target: !Sub "integrations/${SakhiConnectIntegration}"
+
+  SakhiConnectPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SakhiWebSocketConnectFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SakhiWebSocketApi}/*"
+
+  SakhiDisconnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref SakhiWebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SakhiWebSocketDisconnectFunction.Arn}/invocations"
+
+  SakhiDisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref SakhiWebSocketApi
+      RouteKey: "$disconnect"
+      Target: !Sub "integrations/${SakhiDisconnectIntegration}"
+
+  SakhiDisconnectPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SakhiWebSocketDisconnectFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SakhiWebSocketApi}/*"
+
+  SakhiWebSocketDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+      - SakhiConnectRoute
+      - SakhiDisconnectRoute
+    Properties:
+      ApiId: !Ref SakhiWebSocketApi
+
+  SakhiWebSocketStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref SakhiWebSocketApi
+      DeploymentId: !Ref SakhiWebSocketDeployment
+      StageName: dev
+
+  SakhiEscalationStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: Sakhi_EscalationStateMachine
+      DefinitionUri: statemachine/sakhi_escalation.asl.json
+      DefinitionSubstitutions:
+        SendNotificationFunctionArn: !GetAtt SakhiSendNotificationFunction.Arn
+        TriggerVoiceCallFunctionArn: !GetAtt SakhiTriggerVoiceCallFunction.Arn
+        TableName: !Ref SakhiRecordsTable
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SakhiSendNotificationFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SakhiTriggerVoiceCallFunction
+        - DynamoDBReadPolicy:
+            TableName: !Ref SakhiRecordsTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref SakhiRecordsTable
+      # Started by Sakhi_CreateIncident (POST /incidents) for
+      # SCREAM_DETECTED / CODEWORD incidents only, with input shaped as
+      # {"incidentId": "<id>"}. Never started for /incidents/manual.
+
+Outputs:
+  ApiUrl:
+    Value: !Sub "https://${SakhiApi}.execute-api.${AWS::Region}.amazonaws.com/dev/"
+  WebSocketUrl:
+    Value: !Sub "wss://${SakhiWebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/dev"
+  TableName:
+    Value: !Ref SakhiRecordsTable
+  ConnectionsTableName:
+    Value: !Ref SakhiConnectionsTable
+  CreateUserArn:
+    Value: !GetAtt SakhiCreateUserFunction.Arn
+  CreateIncidentArn:
+    Value: !GetAtt SakhiCreateIncidentFunction.Arn
+  CancelIncidentArn:
+    Value: !GetAtt SakhiCancelIncidentFunction.Arn
+  UpdateLocationArn:
+    Value: !GetAtt SakhiUpdateLocationFunction.Arn
+  CheckIncidentStatusArn:
+    Value: !GetAtt SakhiCheckIncidentStatusFunction.Arn
+  SendNotificationArn:
+    Value: !GetAtt SakhiSendNotificationFunction.Arn
+  TriggerVoiceCallArn:
+    Value: !GetAtt SakhiTriggerVoiceCallFunction.Arn
+  ManualIncidentArn:
+    Value: !GetAtt SakhiManualIncidentFunction.Arn
+  EscalationStateMachineArn:
+    Value: !Ref SakhiEscalationStateMachine
+  WebSocketConnectArn:
+    Value: !GetAtt SakhiWebSocketConnectFunction.Arn
+  WebSocketDisconnectArn:
+    Value: !GetAtt SakhiWebSocketDisconnectFunction.Arn
+  DispatchOnSevereIncidentArn:
+    Value: !GetAtt SakhiDispatchOnSevereIncidentFunction.Arn
