@@ -12,7 +12,7 @@ In an attack, the victim usually can't reach her phone, so an SOS button doesn't
 |---|---|
 | Backend API (dev stage) | https://mhkvqscbve.execute-api.ap-south-1.amazonaws.com/dev/ |
 | Police dashboard (Amplify) | https://staging.d3coiri9lx0kr0.amplifyapp.com/ |
-| Demo video | _add your YouTube (unlisted/public) link here_ |
+| Demo video | https://youtu.be/8z_k53131Xs |
 
 ## How it works
 
