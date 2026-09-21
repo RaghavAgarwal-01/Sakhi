@@ -153,7 +153,7 @@ npm run dev
 | Who | Owns |
 |---|---|
 | **Raghav** ([@RaghavAgarwal-01](https://github.com/RaghavAgarwal-01)) | AWS backend (Step Functions, Lambdas, DynamoDB, REST + WebSocket APIs) and the police/helpline dashboard |
-| **Sambhavi Gupta** | **Mobile client** (React Native + TypeScript), described below |
+| **Sambhavi Gupta** ((https://github.com/SambhaviGupta))| **Mobile client** (React Native + TypeScript), described below |
 
 ### What the mobile app will do
 
